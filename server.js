@@ -11,12 +11,13 @@ const PORT = process.env.PORT || 3000;
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
 const EVENT_PIN = process.env.EVENT_PIN || '';
 const DATA_FILE = path.join(__dirname, 'data', 'photos.json');
+const UPLOADS_DIR = path.join(__dirname, 'data', 'uploads');
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-if (!DRIVE_FOLDER_ID) {
-  console.error('Falta DRIVE_FOLDER_ID en las variables de entorno. Revisa el README.');
-  process.exit(1);
-}
-
+// Si no hay credenciales de Google configuradas todavia, la app sigue
+// funcionando: guarda las fotos localmente para que la galeria funcione hoy
+// mismo, y quedan listas para sincronizarse a Drive en cuanto se agreguen
+// GOOGLE_SERVICE_ACCOUNT_KEY y DRIVE_FOLDER_ID (ver README).
 function loadServiceAccountCredentials() {
   if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
     return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -24,16 +25,22 @@ function loadServiceAccountCredentials() {
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     return require(path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS));
   }
-  throw new Error(
-    'Falta GOOGLE_SERVICE_ACCOUNT_KEY o GOOGLE_APPLICATION_CREDENTIALS en las variables de entorno.'
-  );
+  return null;
 }
 
-const auth = new google.auth.GoogleAuth({
-  credentials: loadServiceAccountCredentials(),
-  scopes: ['https://www.googleapis.com/auth/drive'],
-});
-const drive = google.drive({ version: 'v3', auth });
+const driveEnabled = Boolean(DRIVE_FOLDER_ID && loadServiceAccountCredentials());
+let drive = null;
+if (driveEnabled) {
+  const auth = new google.auth.GoogleAuth({
+    credentials: loadServiceAccountCredentials(),
+    scopes: ['https://www.googleapis.com/auth/drive'],
+  });
+  drive = google.drive({ version: 'v3', auth });
+} else {
+  console.warn(
+    'GOOGLE_SERVICE_ACCOUNT_KEY / DRIVE_FOLDER_ID no configurados: las fotos se guardan localmente en data/uploads.'
+  );
+}
 
 // --- Almacen simple de metadata (fotos, likes, comentarios) en un archivo JSON. ---
 // Las escrituras se serializan con una cola para evitar corromper el archivo
@@ -76,6 +83,8 @@ app.get('/api/config', (req, res) => {
   res.json({ pinRequired: Boolean(EVENT_PIN) });
 });
 
+app.use('/uploads', express.static(UPLOADS_DIR));
+
 app.get('/api/photos', (req, res) => {
   const feed = [...photos]
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
@@ -84,6 +93,7 @@ app.get('/api/photos', (req, res) => {
       guestName: p.guestName,
       mimeType: p.mimeType,
       driveFileId: p.driveFileId,
+      localUrl: p.localFile ? `/uploads/${p.localFile}` : null,
       createdAt: p.createdAt,
       likes: p.likes,
       comments: p.comments,
@@ -106,32 +116,38 @@ app.post('/api/upload', upload.single('photo'), async (req, res) => {
     const extension = path.extname(req.file.originalname) || '';
     const fileName = `${safeName} - ${timestamp}${extension}`;
 
-    const bufferStream = new stream.PassThrough();
-    bufferStream.end(req.file.buffer);
+    const localFile = `${crypto.randomUUID()}${extension}`;
+    await fs.promises.writeFile(path.join(UPLOADS_DIR, localFile), req.file.buffer);
 
-    const driveResponse = await drive.files.create({
-      requestBody: {
-        name: fileName,
-        parents: [DRIVE_FOLDER_ID],
-      },
-      media: {
-        mimeType: req.file.mimetype,
-        body: bufferStream,
-      },
-      fields: 'id, name',
-    });
+    let driveFileId = null;
+    if (driveEnabled) {
+      const bufferStream = new stream.PassThrough();
+      bufferStream.end(req.file.buffer);
 
-    const driveFileId = driveResponse.data.id;
+      const driveResponse = await drive.files.create({
+        requestBody: {
+          name: fileName,
+          parents: [DRIVE_FOLDER_ID],
+        },
+        media: {
+          mimeType: req.file.mimetype,
+          body: bufferStream,
+        },
+        fields: 'id, name',
+      });
+      driveFileId = driveResponse.data.id;
 
-    // Hace el archivo visible via link para poder mostrarlo en la galeria publica.
-    await drive.permissions.create({
-      fileId: driveFileId,
-      requestBody: { role: 'reader', type: 'anyone' },
-    });
+      // Hace el archivo visible via link para poder mostrarlo en la galeria publica.
+      await drive.permissions.create({
+        fileId: driveFileId,
+        requestBody: { role: 'reader', type: 'anyone' },
+      });
+    }
 
     const photo = {
       id: crypto.randomUUID(),
       driveFileId,
+      localFile,
       guestName,
       mimeType: req.file.mimetype,
       createdAt: new Date().toISOString(),
@@ -141,9 +157,9 @@ app.post('/api/upload', upload.single('photo'), async (req, res) => {
     photos.push(photo);
     await persist();
 
-    res.json({ ok: true, id: photo.id, fileId: driveFileId, fileName: driveResponse.data.name });
+    res.json({ ok: true, id: photo.id, fileId: driveFileId, fileName });
   } catch (err) {
-    console.error('Error subiendo a Drive:', err);
+    console.error('Error subiendo la foto:', err);
     res.status(500).json({ error: 'No se pudo subir la foto. Intenta de nuevo.' });
   }
 });

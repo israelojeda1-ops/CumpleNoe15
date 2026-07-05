@@ -70,6 +70,7 @@
   .post-header .time { font-size: 0.75rem; color: var(--muted); }
   .media-wrap { width: 100%; background: #000; }
   .media-wrap img { width: 100%; display: block; max-height: 480px; object-fit: cover; }
+  .media-wrap video { width: 100%; display: block; max-height: 480px; }
   .media-wrap iframe { width: 100%; height: 320px; border: 0; display: block; }
   .actions { display: flex; align-items: center; gap: 14px; padding: 10px 14px 4px; }
   .like-btn {
@@ -351,10 +352,17 @@
     }
 
     function mediaHtml(photo) {
-      if (photo.mimeType.startsWith('video/')) {
-        return `<div class="media-wrap"><iframe src="https://drive.google.com/file/d/${photo.driveFileId}/preview" allow="autoplay" allowfullscreen></iframe></div>`;
+      const isVideo = photo.mimeType.startsWith('video/');
+      if (photo.driveFileId) {
+        if (isVideo) {
+          return `<div class="media-wrap"><iframe src="https://drive.google.com/file/d/${photo.driveFileId}/preview" allow="autoplay" allowfullscreen></iframe></div>`;
+        }
+        return `<div class="media-wrap"><img loading="lazy" src="https://drive.google.com/thumbnail?id=${photo.driveFileId}&sz=w1000" alt="Foto de ${escapeHtml(photo.guestName)}" /></div>`;
       }
-      return `<div class="media-wrap"><img loading="lazy" src="https://drive.google.com/thumbnail?id=${photo.driveFileId}&sz=w1000" alt="Foto de ${photo.guestName}" /></div>`;
+      if (isVideo) {
+        return `<div class="media-wrap"><video controls playsinline src="${photo.localUrl}"></video></div>`;
+      }
+      return `<div class="media-wrap"><img loading="lazy" src="${photo.localUrl}" alt="Foto de ${escapeHtml(photo.guestName)}" /></div>`;
     }
 
     function commentsHtml(photo) {
