@@ -45,6 +45,35 @@
   }
   header p { margin: 0; opacity: 0.85; font-size: 0.9rem; letter-spacing: 0.5px; color: var(--muted); }
 
+  .tabs {
+    max-width: 480px;
+    margin: 0 auto 16px;
+    padding: 0 12px;
+    display: flex;
+    gap: 8px;
+  }
+  .tab-btn {
+    flex: 1;
+    padding: 10px;
+    border-radius: 14px;
+    border: 1px solid var(--card-border);
+    background: var(--card);
+    color: var(--muted);
+    font-weight: 700;
+    font-size: 0.85rem;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+  }
+  .tab-btn.active {
+    color: #fff;
+    background: linear-gradient(135deg, var(--pink-glow), var(--accent-dark));
+    border-color: transparent;
+  }
+  .rank-badge {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--pink-glow);
+  }
   #feed {
     max-width: 480px;
     margin: 0 auto;
@@ -228,8 +257,13 @@
 <body>
   <header>
     <h1>Noemi 15 🖤</h1>
-    <p>Sube tus fotos y videos, dale like y deja un comentario</p>
+    <p>Sube tus fotos y videos, vota por tus favoritas y deja un comentario</p>
   </header>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-mode="recent">Recientes</button>
+    <button class="tab-btn" data-mode="ranking">🏆 Ranking</button>
+  </div>
 
   <div id="feed"></div>
   <div id="emptyState" style="display:none;">Todavia no hay fotos... ¡se la primera persona en subir una! 📸</div>
@@ -377,6 +411,8 @@
       return div.innerHTML;
     }
 
+    const medals = ['🥇', '🥈', '🥉'];
+
     function renderFeed(photos) {
       if (!photos.length) {
         feedEl.innerHTML = '';
@@ -384,10 +420,10 @@
         return;
       }
       emptyState.style.display = 'none';
-      feedEl.innerHTML = photos.map(photo => `
+      feedEl.innerHTML = photos.map((photo, idx) => `
         <div class="post" data-id="${photo.id}">
           <div class="post-header">
-            <span class="name">${escapeHtml(photo.guestName)}</span>
+            <span class="name">${sortMode === 'ranking' ? `<span class="rank-badge">${medals[idx] || `#${idx + 1}`}</span> ` : ''}${escapeHtml(photo.guestName)}</span>
             <span class="time">${timeAgo(photo.createdAt)}</span>
           </div>
           ${mediaHtml(photo)}
@@ -395,7 +431,7 @@
             <button class="like-btn ${likedLocally.has(photo.id) ? 'liked' : ''}" data-action="like">
               ${likedLocally.has(photo.id) ? '❤️' : '🤍'}
             </button>
-            <span class="like-count">${photo.likes} ${photo.likes === 1 ? 'like' : 'likes'}</span>
+            <span class="like-count">${photo.likes} ${photo.likes === 1 ? 'voto' : 'votos'}</span>
           </div>
           <div class="comments">
             ${commentsHtml(photo)}
@@ -445,12 +481,24 @@
       input.disabled = false;
     });
 
+    let sortMode = 'recent';
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        sortMode = btn.dataset.mode;
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+        loadFeed();
+      });
+    });
+
     let lastScroll = 0;
     async function loadFeed() {
       lastScroll = window.scrollY;
       try {
         const res = await fetch('/api/photos');
-        const photos = await res.json();
+        let photos = await res.json();
+        if (sortMode === 'ranking') {
+          photos = photos.slice().sort((a, b) => b.likes - a.likes || new Date(a.createdAt) - new Date(b.createdAt));
+        }
         renderFeed(photos);
       } catch {}
     }
