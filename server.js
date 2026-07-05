@@ -1,0 +1,175 @@
+require('dotenv').config();
+const express = require('express');
+const multer = require('multer');
+const { google } = require('googleapis');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const stream = require('stream');
+
+const PORT = process.env.PORT || 3000;
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
+const EVENT_PIN = process.env.EVENT_PIN || '';
+const DATA_FILE = path.join(__dirname, 'data', 'photos.json');
+
+if (!DRIVE_FOLDER_ID) {
+  console.error('Falta DRIVE_FOLDER_ID en las variables de entorno. Revisa el README.');
+  process.exit(1);
+}
+
+function loadServiceAccountCredentials() {
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+    return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+  }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return require(path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS));
+  }
+  throw new Error(
+    'Falta GOOGLE_SERVICE_ACCOUNT_KEY o GOOGLE_APPLICATION_CREDENTIALS en las variables de entorno.'
+  );
+}
+
+const auth = new google.auth.GoogleAuth({
+  credentials: loadServiceAccountCredentials(),
+  scopes: ['https://www.googleapis.com/auth/drive'],
+});
+const drive = google.drive({ version: 'v3', auth });
+
+// --- Almacen simple de metadata (fotos, likes, comentarios) en un archivo JSON. ---
+// Las escrituras se serializan con una cola para evitar corromper el archivo
+// cuando varios invitados suben/comentan al mismo tiempo.
+fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+
+let photos = [];
+try {
+  photos = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+} catch {
+  photos = [];
+}
+
+let writeQueue = Promise.resolve();
+function persist() {
+  writeQueue = writeQueue.then(
+    () => fs.promises.writeFile(DATA_FILE, JSON.stringify(photos, null, 2)),
+    () => fs.promises.writeFile(DATA_FILE, JSON.stringify(photos, null, 2))
+  );
+  return writeQueue;
+}
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se permiten fotos o videos'));
+    }
+  },
+});
+
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+app.get('/api/config', (req, res) => {
+  res.json({ pinRequired: Boolean(EVENT_PIN) });
+});
+
+app.get('/api/photos', (req, res) => {
+  const feed = [...photos]
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .map((p) => ({
+      id: p.id,
+      guestName: p.guestName,
+      mimeType: p.mimeType,
+      driveFileId: p.driveFileId,
+      createdAt: p.createdAt,
+      likes: p.likes,
+      comments: p.comments,
+    }));
+  res.json(feed);
+});
+
+app.post('/api/upload', upload.single('photo'), async (req, res) => {
+  try {
+    if (EVENT_PIN && req.body.pin !== EVENT_PIN) {
+      return res.status(401).json({ error: 'PIN incorrecto' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se recibio ningun archivo' });
+    }
+
+    const guestName = (req.body.guestName || 'Invitado').trim().slice(0, 60) || 'Invitado';
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeName = guestName.replace(/[^a-zA-Z0-9 _-]/g, '') || 'Invitado';
+    const extension = path.extname(req.file.originalname) || '';
+    const fileName = `${safeName} - ${timestamp}${extension}`;
+
+    const bufferStream = new stream.PassThrough();
+    bufferStream.end(req.file.buffer);
+
+    const driveResponse = await drive.files.create({
+      requestBody: {
+        name: fileName,
+        parents: [DRIVE_FOLDER_ID],
+      },
+      media: {
+        mimeType: req.file.mimetype,
+        body: bufferStream,
+      },
+      fields: 'id, name',
+    });
+
+    const driveFileId = driveResponse.data.id;
+
+    // Hace el archivo visible via link para poder mostrarlo en la galeria publica.
+    await drive.permissions.create({
+      fileId: driveFileId,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+
+    const photo = {
+      id: crypto.randomUUID(),
+      driveFileId,
+      guestName,
+      mimeType: req.file.mimetype,
+      createdAt: new Date().toISOString(),
+      likes: 0,
+      comments: [],
+    };
+    photos.push(photo);
+    await persist();
+
+    res.json({ ok: true, id: photo.id, fileId: driveFileId, fileName: driveResponse.data.name });
+  } catch (err) {
+    console.error('Error subiendo a Drive:', err);
+    res.status(500).json({ error: 'No se pudo subir la foto. Intenta de nuevo.' });
+  }
+});
+
+app.post('/api/photos/:id/like', async (req, res) => {
+  const photo = photos.find((p) => p.id === req.params.id);
+  if (!photo) return res.status(404).json({ error: 'Foto no encontrada' });
+  photo.likes += 1;
+  await persist();
+  res.json({ ok: true, likes: photo.likes });
+});
+
+app.post('/api/photos/:id/comments', async (req, res) => {
+  const photo = photos.find((p) => p.id === req.params.id);
+  if (!photo) return res.status(404).json({ error: 'Foto no encontrada' });
+
+  const author = (req.body.author || 'Invitado').trim().slice(0, 60) || 'Invitado';
+  const text = (req.body.text || '').trim().slice(0, 300);
+  if (!text) return res.status(400).json({ error: 'El comentario esta vacio' });
+
+  const comment = { id: crypto.randomUUID(), author, text, createdAt: new Date().toISOString() };
+  photo.comments.push(comment);
+  await persist();
+  res.json({ ok: true, comment });
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor listo en http://localhost:${PORT}`);
+});
